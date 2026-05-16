@@ -37,18 +37,8 @@ const server = http.createServer((req, res) => {
 // ── WebSocket ────────────────────────────────────
 const wss = new WebSocket.Server({ server });
 
-// rooms: Map<roomId, Set<WebSocket>>
-// Cada sala = 2 dispositivos (walkie-talkie)
+// rooms: Map<roomId, Map<userId, WebSocket>>
 const rooms = new Map();
-
-function getRoomPeer(ws) {
-  const room = rooms.get(ws.roomId);
-  if (!room) return null;
-  for (const peer of room) {
-    if (peer !== ws && peer.readyState === WebSocket.OPEN) return peer;
-  }
-  return null;
-}
 
 function send(ws, msg) {
   if (ws.readyState === WebSocket.OPEN) {
@@ -62,45 +52,50 @@ wss.on('connection', (ws, req) => {
   const roomId = match ? match[1] : 'default';
 
   ws.roomId = roomId;
+  ws.id = Math.random().toString(36).substring(2, 10);
 
-  if (!rooms.has(roomId)) rooms.set(roomId, new Set());
+  if (!rooms.has(roomId)) rooms.set(roomId, new Map());
   const room = rooms.get(roomId);
 
-  // Sala llena
-  if (room.size >= 2) {
-    send(ws, { type: 'error', code: 'ROOM_FULL', message: 'Sala llena. Máx. 2 dispositivos.' });
-    ws.close();
-    return;
-  }
+  room.set(ws.id, ws);
 
-  room.add(ws);
-  const isInitiator = room.size === 1;
-  ws.role = isInitiator ? 'initiator' : 'receiver';
+  console.log(`[+] ${roomId} | ${ws.id} conectado | sala: ${room.size}`);
 
-  console.log(`[+] ${roomId} | ${ws.role} conectado | sala: ${room.size}/2`);
-
+  // Avisar al nuevo de quiénes están ya en la sala
+  const existingPeers = Array.from(room.keys()).filter(id => id !== ws.id);
   send(ws, {
     type: 'welcome',
-    role: ws.role,
+    id: ws.id,
     roomId,
-    peerCount: room.size
+    peers: existingPeers
   });
 
-  // Cuando el segundo llega, avisar a ambos
-  if (room.size === 2) {
-    for (const peer of room) {
-      send(peer, { type: 'peer-ready', peerCount: 2 });
+  // Avisar a los que ya estaban de que ha entrado alguien nuevo
+  for (const [id, peer] of room.entries()) {
+    if (id !== ws.id) {
+      send(peer, { type: 'peer-joined', peerId: ws.id });
     }
-    console.log(`✅ ${roomId} | ambos conectados — WebRTC iniciando`);
   }
 
   // ── Relay de señalización ──────────────────────
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      const peer = getRoomPeer(ws);
-      if (peer) {
-        peer.send(JSON.stringify(msg));
+      msg.sender = ws.id;
+
+      // Enrutamiento específico si tiene 'target'
+      if (msg.target) {
+        const targetWs = room.get(msg.target);
+        if (targetWs) {
+          send(targetWs, msg);
+        }
+      } else {
+        // Broadcast a todos menos a mí (por si acaso)
+        for (const [id, peer] of room.entries()) {
+          if (id !== ws.id) {
+            send(peer, msg);
+          }
+        }
       }
     } catch (e) {
       console.error('Parse error:', e.message);
@@ -108,21 +103,22 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    room.delete(ws);
-    console.log(`[-] ${roomId} | ${ws.role} desconectado | sala: ${room.size}/2`);
+    room.delete(ws.id);
+    console.log(`[-] ${roomId} | ${ws.id} desconectado | sala: ${room.size}`);
 
     // Limpiar sala vacía
     if (room.size === 0) {
       rooms.delete(roomId);
     } else {
-      // Avisar al que queda
-      const peer = getRoomPeer(ws) || [...room][0];
-      if (peer) send(peer, { type: 'peer-disconnected' });
+      // Avisar a los demás
+      for (const [id, peer] of room.entries()) {
+        send(peer, { type: 'peer-disconnected', peerId: ws.id });
+      }
     }
   });
 
   ws.on('error', (err) => {
-    console.error(`Error ${roomId}/${ws.role}:`, err.message);
+    console.error(`Error ${roomId}/${ws.id}:`, err.message);
   });
 });
 

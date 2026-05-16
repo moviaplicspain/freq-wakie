@@ -614,6 +614,33 @@ body::before {
 }
 
 #toast.show { transform: translateX(-50%) translateY(0); }
+
+/* Mode Selector */
+.mode-selector {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+  margin-bottom: 16px;
+  background: var(--surface2);
+  border: 1px solid var(--border2);
+  border-radius: 10px;
+  padding: 16px;
+}
+.mode-selector label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-mid);
+  cursor: pointer;
+}
+.mode-selector input[type="radio"] {
+  accent-color: var(--amber);
+  width: 16px;
+  height: 16px;
+}
 </style>
 </head>
 <body>
@@ -641,6 +668,12 @@ body::before {
         autocorrect="off"
         spellcheck="false"
       >
+    </div>
+
+    <div class="mode-selector">
+      <label><input type="radio" name="mode" value="ambos" checked> 🔄 Bidireccional (Escucha y Habla)</label>
+      <label><input type="radio" name="mode" value="emisor"> 🎙️ Solo Emisor (Micro abierto)</label>
+      <label><input type="radio" name="mode" value="receptor"> 🎧 Solo Receptor (Solo escucha)</label>
     </div>
 
     <button class="btn btn-primary" id="join-btn" onclick="joinRoom()">
@@ -751,7 +784,7 @@ body::before {
 
 <!-- Toast de error -->
 <div id="toast"></div>
-<audio id="remote-audio" autoplay playsinline></audio>
+<!-- Audio dinámico se creará por JS -->
 
 <script>
 // ═══════════════════════════════════════════════
@@ -791,10 +824,10 @@ const ICE_CONFIG = {
 
 // ── Estado global ─────────────────────────────
 let ws         = null;
-let pc         = null;
+let peers      = {};
+let myId       = null;
+let myMode     = 'ambos';
 let localStream= null;
-let sender     = null;
-let role       = null;
 let roomId     = null;
 let isTx       = false;
 let audioCtx   = null;
@@ -849,6 +882,12 @@ function createRoom() {
 function joinRoom() {
   const id = roomInput.value.trim().toUpperCase();
   if (!id || id.length < 3) { showToast('Introduce un código de canal (mín. 3 letras)'); return; }
+
+  const selectedMode = document.querySelector('input[name="mode"]:checked');
+  if (selectedMode) {
+    myMode = selectedMode.value;
+  }
+
   roomId = id;
   connectWS(roomId);
 }
@@ -895,41 +934,72 @@ async function handleMsg(msg) {
   switch (msg.type) {
 
     case 'welcome':
-      role = msg.role;
+      myId = msg.id;
       $('waiting-room-id').textContent = msg.roomId;
       const shareLink = `${location.origin}${location.pathname}?room=${msg.roomId}`;
       $('share-url').textContent = shareLink;
       history.replaceState({}, '', `?room=${msg.roomId}`);
-      showScreen('waiting');
+
+      if (myMode !== 'receptor') {
+         await initLocalAudio();
+      } else {
+         pttBtn.disabled = true;
+         $('ptt-label').textContent = 'Solo RX';
+      }
+
+      showScreen('walkie');
+      updatePeersUI();
+
+      for (const peerId of msg.peers) {
+        await createPeerConnection(peerId, true);
+      }
       break;
 
-    case 'peer-ready':
-      await initWebRTC();
-      if (role === 'initiator') await sendOffer();
+    case 'peer-joined':
+      showToast('Nuevo usuario conectado');
+      createPeerConnection(msg.peerId, false);
       break;
 
     case 'offer':
-      await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      signal({ type: 'answer', sdp: pc.localDescription.sdp });
+      {
+        let pc = peers[msg.sender];
+        if (!pc) pc = await createPeerConnection(msg.sender, false);
+        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        signal({ type: 'answer', target: msg.sender, sdp: pc.localDescription.sdp });
+      }
       break;
 
     case 'answer':
-      await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      {
+        const pc = peers[msg.sender];
+        if (pc) await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+      }
       break;
 
     case 'ice-candidate':
-      if (msg.candidate) {
-        try { await pc.addIceCandidate(msg.candidate); } catch(e) {}
+      {
+        const pc = peers[msg.sender];
+        if (pc && msg.candidate) {
+          try { await pc.addIceCandidate(msg.candidate); } catch(e) {}
+        }
       }
       break;
 
     case 'peer-disconnected':
-      showToast('El otro dispositivo se desconectó');
-      setStatus('Desconectado', 'red');
-      pttBtn.disabled = true;
-      setTimeout(leaveRoom, 2500);
+      {
+        showToast('Un usuario se desconectó');
+        const pc = peers[msg.peerId];
+        if (pc) {
+          pc.close();
+          delete peers[msg.peerId];
+        }
+        const audioEl = document.getElementById(`audio-${msg.peerId}`);
+        if (audioEl) audioEl.remove();
+        updatePeersUI();
+        checkRXState();
+      }
       break;
 
     case 'error':
@@ -944,24 +1014,15 @@ function signal(msg) {
 }
 
 // ═══════════════════════════════════════════════
-//  WEBRTC
+//  WEBRTC MULTI-PEER
 // ═══════════════════════════════════════════════
-async function initWebRTC() {
-  pc = new RTCPeerConnection(ICE_CONFIG);
-
+async function initLocalAudio() {
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        sampleRate: 16000,
-        channelCount: 1
+        echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+        sampleRate: 16000, channelCount: 1
       }
-    });
-
-    localStream.getAudioTracks().forEach(t => {
-      sender = pc.addTrack(t, localStream);
     });
 
     startWaveform(localStream);
@@ -972,42 +1033,76 @@ async function initWebRTC() {
   } catch (err) {
     showToast('Sin acceso al micrófono: ' + err.name);
   }
+}
+
+async function createPeerConnection(peerId, isInitiator) {
+  const pc = new RTCPeerConnection(ICE_CONFIG);
+  peers[peerId] = pc;
 
   pc.onicecandidate = ({ candidate }) => {
-    signal({ type: 'ice-candidate', candidate });
+    signal({ type: 'ice-candidate', target: peerId, candidate });
   };
 
   pc.onconnectionstatechange = () => {
-    const s = pc.connectionState;
-    console.log('WebRTC:', s);
-
-    if (s === 'connected') {
-      $('top-room-id').textContent = roomId;
-      $('st-rol').textContent = role === 'initiator' ? 'Primario' : 'Secundario';
-      pttBtn.disabled = false;
-      showScreen('walkie');
-      startStatsPolling();
-    }
-
-    if (s === 'failed' || s === 'disconnected') {
-      setStatus('Error de enlace', 'red');
-      pttBtn.disabled = true;
-    }
+    updatePeersUI();
   };
+
+  if (localStream && myMode !== 'receptor') {
+    localStream.getAudioTracks().forEach(t => pc.addTrack(t, localStream));
+  }
 
   pc.ontrack = ({ streams }) => {
-    remoteAudio.srcObject = streams[0];
+    if (myMode === 'emisor') return;
+
+    let audioEl = document.getElementById(`audio-${peerId}`);
+    if (!audioEl) {
+      audioEl = document.createElement('audio');
+      audioEl.id = `audio-${peerId}`;
+      audioEl.autoplay = true;
+      audioEl.playsinline = true;
+      document.body.appendChild(audioEl);
+    }
+    audioEl.srcObject = streams[0];
+
     setRX(true);
-    // Quitar RX cuando el stream de audio se quede en silencio
-    streams[0].getAudioTracks()[0]?.addEventListener('ended', () => setRX(false));
+    streams[0].getAudioTracks()[0]?.addEventListener('ended', () => {
+      checkRXState();
+    });
   };
+
+  if (isInitiator) {
+    const offer = await pc.createOffer({ offerToReceiveAudio: myMode !== 'emisor', offerToReceiveVideo: false });
+    await pc.setLocalDescription(offer);
+    signal({ type: 'offer', target: peerId, sdp: pc.localDescription.sdp });
+  }
+
+  return pc;
 }
 
-async function sendOffer() {
-  const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
-  await pc.setLocalDescription(offer);
-  signal({ type: 'offer', sdp: pc.localDescription.sdp });
+function checkRXState() {
+  let isReceiving = false;
+  document.querySelectorAll('audio[id^="audio-"]').forEach(audio => {
+    if (audio.srcObject && audio.srcObject.getAudioTracks().some(t => t.readyState === 'live')) {
+      isReceiving = true;
+    }
+  });
+  setRX(isReceiving);
 }
+
+function updatePeersUI() {
+  const count = Object.keys(peers).length;
+  $('st-rol').textContent = `${myMode.toUpperCase()} (${count} peers)`;
+  $('top-room-id').textContent = roomId;
+
+  if (count > 0) {
+    setStatus('Conectado', 'green');
+    if (myMode !== 'receptor') pttBtn.disabled = false;
+  } else {
+    setStatus('Esperando', 'amber');
+  }
+}
+
+
 
 // ═══════════════════════════════════════════════
 //  MUTE TOGGLE
@@ -1076,9 +1171,13 @@ function stopWaveform() {
 // ═══════════════════════════════════════════════
 function startStatsPolling() {
   statsTimer = setInterval(async () => {
-    if (!pc) return;
+    // Only poll the first connected peer for UI display as a general indication
+    const firstPeerId = Object.keys(peers)[0];
+    if (!firstPeerId) return;
+    const currentPc = peers[firstPeerId];
+
     try {
-      const stats = await pc.getStats();
+      const stats = await currentPc.getStats();
       for (const [, s] of stats) {
         if (s.type === 'candidate-pair' && s.state === 'succeeded') {
           const rtt = s.currentRoundTripTime;
@@ -1123,12 +1222,19 @@ function showToast(msg) {
 function cleanup() {
   clearInterval(statsTimer);
   stopWaveform();
-  if (sender && pc) { try { pc.removeTrack(sender); } catch(e) {} sender = null; }
+
+  Object.keys(peers).forEach(peerId => {
+    try { peers[peerId].close(); } catch(e) {}
+    delete peers[peerId];
+    const audioEl = document.getElementById(`audio-${peerId}`);
+    if (audioEl) audioEl.remove();
+  });
+
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-  if (pc) { try { pc.close(); } catch(e) {} pc = null; }
   if (ws) { try { ws.close(); } catch(e) {} ws = null; }
+
   isTx = false;
-  role = null;
+  myId = null;
   roomId = null;
   setRX(false);
   pttBtn.classList.remove('tx-active', 'rx-active');
