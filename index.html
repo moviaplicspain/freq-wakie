@@ -728,14 +728,9 @@ body::before {
     <div class="ptt-outer">
       <div class="ptt-halo" id="ptt-halo"></div>
       <button class="ptt-btn" id="ptt-btn" disabled
-        ontouchstart="pttDown(event)"
-        ontouchend="pttUp(event)"
-        ontouchcancel="pttUp(event)"
-        onmousedown="pttDown(event)"
-        onmouseup="pttUp(event)"
-        onmouseleave="pttUp(event)">
-        <span class="ptt-mic">🎙️</span>
-        <span class="ptt-label">Pulsa</span>
+        onclick="toggleMute()">
+        <span class="ptt-mic" id="ptt-mic">🎙️</span>
+        <span class="ptt-label" id="ptt-label">Mic On</span>
       </button>
     </div>
 
@@ -954,6 +949,30 @@ function signal(msg) {
 async function initWebRTC() {
   pc = new RTCPeerConnection(ICE_CONFIG);
 
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 16000,
+        channelCount: 1
+      }
+    });
+
+    localStream.getAudioTracks().forEach(t => {
+      sender = pc.addTrack(t, localStream);
+    });
+
+    startWaveform(localStream);
+    isTx = true;
+    pttBtn.classList.add('tx-active');
+    txInd.classList.add('on');
+    $('ptt-label').textContent = 'Mic On';
+  } catch (err) {
+    showToast('Sin acceso al micrófono: ' + err.name);
+  }
+
   pc.onicecandidate = ({ candidate }) => {
     signal({ type: 'ice-candidate', candidate });
   };
@@ -991,49 +1010,25 @@ async function sendOffer() {
 }
 
 // ═══════════════════════════════════════════════
-//  PUSH-TO-TALK
+//  MUTE TOGGLE
 // ═══════════════════════════════════════════════
-async function pttDown(e) {
-  e.preventDefault();
-  if (!pc || isTx || pttBtn.disabled) return;
-  isTx = true;
+function toggleMute() {
+  if (!localStream) return;
+  const audioTrack = localStream.getAudioTracks()[0];
+  if (audioTrack) {
+    audioTrack.enabled = !audioTrack.enabled;
+    isTx = audioTrack.enabled;
 
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        sampleRate: 16000,
-        channelCount: 1
-      }
-    });
-
-    localStream.getAudioTracks().forEach(t => {
-      sender = pc.addTrack(t, localStream);
-    });
-
-    startWaveform(localStream);
-    pttBtn.classList.add('tx-active');
-    txInd.classList.add('on');
-
-  } catch (err) {
-    isTx = false;
-    showToast('Sin acceso al micrófono: ' + err.name);
+    if (isTx) {
+      pttBtn.classList.add('tx-active');
+      txInd.classList.add('on');
+      $('ptt-label').textContent = 'Mic On';
+    } else {
+      pttBtn.classList.remove('tx-active');
+      txInd.classList.remove('on');
+      $('ptt-label').textContent = 'Silenciado';
+    }
   }
-}
-
-function pttUp(e) {
-  e.preventDefault();
-  if (!isTx) return;
-  isTx = false;
-
-  if (sender && pc) { try { pc.removeTrack(sender); } catch(e) {} sender = null; }
-  if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-
-  stopWaveform();
-  pttBtn.classList.remove('tx-active');
-  txInd.classList.remove('on');
 }
 
 // ═══════════════════════════════════════════════
