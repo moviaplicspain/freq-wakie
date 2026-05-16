@@ -1,0 +1,15 @@
+{
+  "name": "freq-walkie-talkie",
+  "version": "2.0.0",
+  "description": "Walkie-talkie P2P por internet con WebRTC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
